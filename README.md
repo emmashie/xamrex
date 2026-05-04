@@ -1,21 +1,16 @@
 # xamrex: AMReX Backend for xarray
 
-An xarray backend for reading AMReX plotfiles with native support for C-grid staggered variables, time series concatenation, and multi-level AMR data.
+An xarray backend for reading AMReX plotfiles with native support for time series concatenation and multi-level AMR data.
 
 ## Overview
 
-`xamrex` registers the `amrex` backend to xarray for working with AMReX simulation data in Python. The package supports:
-- **C-grid staggered variables** - Automatic detection and handling of rho, u, v, w, and psi grid points
-- **2D and 3D variables** - Both vertically-integrated and full 3D fields
-- **Multi-level AMR** - Proper coordinate scaling for refined levels
-- **Time series** - Intelligent handling of multiple plotfiles with level masking
-- **Lazy loading** - Dask-backed arrays for efficient memory usage
+`xamrex` registers the `amrex` backend to xarray for working with AMReX simulation data in Python. The package supports both single plotfiles and multi-time series datasets, with intelligent handling of adaptive mesh refinement (AMR) levels. Efficient memory usage is achived with dask-backed arrays for lazy loading and large datasets.
 
 ## Installation
 
 ```bash
 # Install from source
-git clone https://github.com/hetland/xamrex.git
+git clone https://github.com/your-repo/xamrex.git
 cd xamrex
 pip install -e .
 ```
@@ -27,187 +22,275 @@ pip install -e .
 ```python
 import xarray as xr
 
-# Load single AMReX plotfile at Level 0
-ds = xr.open_dataset('plt00000', engine='amrex', level=0)
+# Load single AMReX plotfile
+ds = xr.open_dataset('plt_00000', engine='amrex', level=0)
 
 # Access data variables (lazy loaded)
 temperature = ds['temp']
-salinity = ds['salt']
-print(f"Variables: {list(ds.data_vars)}")
-print(f"Dimensions: {dict(ds.dims)}")
+print(f"Shape: {temperature.shape}")
+print(f"Time: {ds.attrs['current_time']}")
 ```
 
 ### Time Series (Multiple Files)
 
 ```python
 import xarray as xr
-from glob import glob
 
-# Load multiple plotfiles as time series
-files = sorted(glob('simulation/plt*'))
-ds = xr.open_dataset(files, engine='amrex', level=0)
+# Method 1: Explicit file list
+plotfiles = ['plt_00000', 'plt_01000', 'plt_02000']
+ds = xr.open_dataset(plotfiles, engine='amrex', level=0)
 
-# Time dimension automatically added
-print(f"Time steps: {len(ds.ocean_time)}")
-print(f"Time range: {ds.ocean_time.values[0]} to {ds.ocean_time.values[-1]}")
+# Method 2: Directory auto-discovery
+ds = xr.open_dataset('simulation_output/', engine='amrex', level=0, pattern='plt_*')
 ```
 
 ### Multi-Level AMR
 
 ```python
 # Load different refinement levels
-ds_level0 = xr.open_dataset(files, engine='amrex', level=0)  # Base level
-ds_level1 = xr.open_dataset(files, engine='amrex', level=1)  # Refined level
+ds_level0 = xr.open_dataset(plotfiles, engine='amrex', level=0)  # Base level
+ds_level1 = xr.open_dataset(plotfiles, engine='amrex', level=1)  # Refined level
 
-print(f"Level 0: {dict(ds_level0.dims)}")  
-print(f"Level 1: {dict(ds_level1.dims)}")  # Higher resolution
-
-# Coordinates are properly scaled for refinement
-print(f"Level 0 cell size: {(ds_level0.x_rho[1] - ds_level0.x_rho[0]).values:.1f}m")
-print(f"Level 1 cell size: {(ds_level1.x_rho[1] - ds_level1.x_rho[0]).values:.1f}m")
+print(f"Level 0: {dict(ds_level0.sizes)}")  
+print(f"Level 1: {dict(ds_level1.sizes)}")  # Higher resolution in x,y
 ```
+Missing levels automatically filled with NaN. Time steps that don't have the requested level are filled completely.
+TODO: Flag levels that never exist within the dataset.
 
-## C-Grid Support
+### Load Auxiliary MultiFabs (2D Variables)
 
-The backend automatically detects and handles staggered C-grid variables:
+Some AMReX applications write additional variables outside `Cell` (for example `rho2d`, `u2d`, `v2d`).
+You can include them directly when opening datasets:
 
 ```python
-ds = xr.open_dataset('plt00000', engine='amrex', level=0)
-
-# Rho-points (cell centers)
-temp = ds['temp']     # dimensions: (ocean_time, z_rho, y_rho, x_rho)
-salt = ds['salt']
-
-# U-points (x-faces)
-u_vel = ds['u_vel']   # dimensions: (ocean_time, z_rho, y_u, x_u)
-
-# V-points (y-faces)
-v_vel = ds['v_vel']   # dimensions: (ocean_time, z_rho, y_v, x_v)
-
-# W-points (z-faces)
-w_vel = ds['w_vel']   # dimensions: (ocean_time, z_w, y_w, x_w)
-
-# 2D variables (barotropic)
-zeta = ds['zeta']     # dimensions: (ocean_time, y_rho, x_rho)
-```
-
-### xgcm Integration
-
-The backend includes xgcm-compatible metadata for grid-aware operations:
-
-```python
-import xgcm
-
-# Create xgcm Grid object
-grid = xgcm.Grid(ds, periodic=False)
-
-# Perform grid-aware operations
-temp_at_u = grid.interp(ds.temp, 'X')  # Interpolate to u-points
-div_h = grid.diff(ds.u_vel, 'X') + grid.diff(ds.v_vel, 'Y')  # Horizontal divergence
-```
-
-## AMR Level Handling
-
-### Automatic Level Detection
-
-The backend automatically handles AMR levels with proper coordinate scaling:
-
-```python
-# Level 0: Base resolution (e.g., 2000m grid spacing)
-ds0 = xr.open_dataset(files, engine='amrex', level=0)
-
-# Level 1: 3x refinement (e.g., 667m grid spacing)  
-ds1 = xr.open_dataset(files, engine='amrex', level=1)
-
-# Coordinates reflect actual physical locations
-# Level 1 covers a subregion with finer resolution
-```
-
-### Level Masking
-
-When a level doesn't exist at certain time steps, those times are filled with NaN:
-
-```python
-# Example: Mixed-level time series
-# plt00000: only level 0 exists
-# plt00100: levels 0 and 1 exist
-# plt00200: levels 0 and 1 exist
-
-ds_level1 = xr.open_dataset(['plt00000', 'plt00100', 'plt00200'], 
-                           engine='amrex', level=1)
-
-# Result: Level 1 dataset with:
-# - Time step 0: All NaN (level 1 doesn't exist)
-# - Time steps 1-2: Valid data where level 1 exists
-```
-
-## Features
-
-### Lazy Loading with Dask
-- Large datasets are handled efficiently with lazy evaluation
-- Only load data when needed for computation
-- Supports out-of-core computation for datasets larger than memory
-
-### 2D and 3D Variables
-- Automatically detects dimensionality from AMReX headers
-- 2D variables: `(ocean_time, y, x)`
-- 3D variables: `(ocean_time, z, y, x)`
-
-### Coordinate Generation
-- Physical coordinates generated from domain bounds
-- Proper staggering for C-grid points
-- Refinement-aware scaling for AMR levels
-
-## Advanced Usage
-
-### Drop Variables to Save Memory
-
-```python
-# Load only specific variables
+# Load specific auxiliary groups
 ds = xr.open_dataset(
-    files, 
-    engine='amrex', 
+    "simulation_output/",
+    engine="amrex",
     level=0,
-    drop_variables=['salt', 'w_vel']
+    pattern="plt_*",
+    auxiliary_multifabs=["rho2d"],
+)
+print("zeta" in ds.data_vars)  # True when rho2d contains zeta
+
+# Or include all auxiliary groups discovered in Header
+ds_all = xr.open_dataset(
+    "simulation_output/",
+    engine="amrex",
+    level=0,
+    pattern="plt_*",
+    include_auxiliary_multifabs=True,
 )
 ```
 
-### Working with Large Time Series
+## xamrex utility functions
+
+### 1. Unified xarray Backend
+
+The `amrex` engine automatically detects input type and handles appropriately:
 
 ```python
-# Load metadata only (fast)
-ds = xr.open_dataset(files, engine='amrex', level=0)
+# Single plotfile directory
+ds = xr.open_dataset("plt_00000", engine='amrex', level=0)
 
-# Select subset before computing
-subset = ds.isel(ocean_time=slice(0, 10))  # First 10 time steps
-subset = subset.sel(z_rho=0)               # Surface only
-result = subset.compute()                   # Load only this subset
+# List of plotfile directories (time series)
+ds = xr.open_dataset(["plt_00000", "plt_01000"], engine='amrex', level=0)
+
+# Directory containing plotfiles (auto-discovery)
+ds = xr.open_dataset("simulation_data/", engine='amrex', level=0, pattern="plt_*")
+
+# Custom patterns
+ds = xr.open_dataset("data/", engine='amrex', level=1, pattern="sim_run_*")
 ```
 
-## Performance
+### 2. Multi-Time Utility Functions
 
-- **Memory Efficient**: Dask arrays enable lazy loading
-- **Scalable**: Handle hundreds of time steps efficiently  
-- **Fast Metadata**: Quick to open without loading data
-- **Chunked Access**: Load only what you need
+```python
+import xamrex
+
+# Primary time series loading function
+ds = xamrex.open_amrex_time_series(plotfiles, level=0)
+
+# Find plotfiles in directory  
+files = xamrex.find_amrex_time_series("data/", pattern="plt_*")
+
+# Create time series from directory
+ds = xamrex.create_time_series_from_directory("data/", pattern="plt_*", level=0)
+
+# Validate file compatibility before loading
+validation = xamrex.validate_time_series_compatibility(plotfiles)
+print(f"Compatible: {validation['compatible']}")
+```
+
+### 3. Time Series Analysis
+
+```python
+# Extract time slices
+early = xamrex.extract_time_slice(ds, time_range=(0, 1000))
+middle = xamrex.extract_time_slice(ds, time_indices=slice(5, 10))
+
+# Compute time statistics
+stats = xamrex.compute_time_statistics(
+    ds, 
+    variables=['temp', 'salt'],
+    statistics=['mean', 'std', 'min', 'max']
+)
+print(f"Statistics: {list(stats.data_vars)}")
+```
+
+### 4. Single-Level Utilities (Legacy Support)
+
+```python
+# Multi-level access utilities
+levels = xamrex.open_amrex_levels("plt_00000", levels=[0, 1, 2])
+summary = xamrex.create_level_summary("plt_00000")
+
+# Level information
+max_level = xamrex.get_max_level("plt_00000") 
+available = xamrex.get_available_levels_from_file("plt_00000")
+
+# Load specific levels
+ds_level0 = xamrex.load_base_level("plt_00000")
+ds_level1 = xamrex.load_level("plt_00000", level=1)
+```
+
+## Advanced Usage
+
+### Custom Time Dimension
+
+```python
+# Use custom time dimension name
+ds = xr.open_dataset(
+    plotfiles, 
+    engine='amrex', 
+    level=0,
+    time_dimension_name='time'  # Instead of default 'ocean_time'
+)
+```
+
+### Custom Spatial Dimensions
+
+```python
+# Rename spatial coordinates
+ds = xr.open_dataset(
+    plotfiles, 
+    engine='amrex', 
+    level=0,
+    dimension_names={'x': 'longitude', 'y': 'latitude', 'z': 'depth'}
+)
+```
+
+### Memory Management
+
+```python
+# Drop variables to save memory
+ds = xr.open_dataset(
+    plotfiles, 
+    engine='amrex', 
+    level=0,
+    drop_variables=['salt', 'other_field']
+)
+
+# Work with large time series efficiently
+large_ds = xamrex.open_amrex_time_series("large_simulation/plt_*", level=0)
+subset = large_ds.isel(ocean_time=slice(0, 10))  # Lazy slicing
+computed = subset.compute()  # Load only subset into memory
+```
+
+
+## Multi-Level AMR Support
+
+### Automatic Level Detection
+
+The backend automatically:
+- Finds the first file with the requested level as a spatial template
+- Uses that template for coordinate structure
+- Fills missing levels with NaN values for time steps that don't have that level
+
+```python
+# Example: Mixed-level time series
+# plt_00000: max_level = 0 (base only)
+# plt_01000: max_level = 1 (has refinement)  
+# plt_02000: max_level = 1 (has refinement)
+
+ds_level1 = xr.open_dataset(['plt_00000', 'plt_01000', 'plt_02000'], 
+                           engine='amrex', level=1)
+
+# Result: Level 1 dataset with:
+# - Time step 0: All NaN (plt_00000 doesn't have level 1)
+# - Time step 1: Valid data where level 1 exists, NaN elsewhere
+# - Time step 2: Valid data where level 1 exists, NaN elsewhere
+```
+
+### Refinement Patterns
+
+```python
+# Level 0: Base resolution
+ds_l0 = xr.open_dataset(files, engine='amrex', level=0)
+print(f"Level 0: {dict(ds_l0.sizes)}")  # {'ocean_time': 3, 'z': 16, 'y': 15, 'x': 42}
+
+# Level 1: Refined in x,y but not z  
+ds_l1 = xr.open_dataset(files, engine='amrex', level=1) 
+print(f"Level 1: {dict(ds_l1.sizes)}")  # {'ocean_time': 3, 'z': 16, 'y': 45, 'x': 126}
+```
+
+## Performance and Scalability
+
+### Memory Efficiency
+- **Lazy Loading**: Dask arrays mean large datasets don't overwhelm memory
+- **Chunked Access**: Only load data when and where you need it
+- **Efficient Concatenation**: Time series concatenation preserves lazy evaluation
+
+### Large Time Series
+```python
+# Handle hundreds of time steps efficiently
+all_files = xamrex.find_amrex_time_series("massive_simulation/", "plt_*")
+print(f"Found {len(all_files)} files")  # Could be 1000+ files
+
+# Still loads quickly (metadata only)
+ds = xamrex.open_amrex_time_series(all_files, level=0)
+
+# Extract just what you need
+recent = ds.isel(ocean_time=slice(-10, None))  # Last 10 time steps
+subset = recent.sel(x=slice(0.25, 0.75))      # Spatial subset
+computed = subset.compute()                    # Only then load data
+```
+
+## Error Handling and Validation
+
+```python
+# Validate compatibility before loading
+validation = xamrex.validate_time_series_compatibility(plotfiles, level=1)
+
+if validation['compatible']:
+    ds = xamrex.open_amrex_time_series(plotfiles, level=1)
+else:
+    print(f"Issues: {validation['issues']}")
+    print(f"Available fields: {validation['fields']}")
+```
 
 ## Requirements
 
 - Python >= 3.8
 - xarray >= 2023.1.0  
 - numpy >= 1.20
-- dask >= 2021.1
+- dask[array] >= 2021.1
 - pandas >= 1.5.0
 
 ## Documentation
 
-Full documentation available at: [https://xamrex.readthedocs.io](https://xamrex.readthedocs.io)
+- [Multi-Time User Guide](README_MULTI_TIME.md) - Detailed multi-time functionality guide
+- [Examples](examples/) - Example scripts and Jupyter notebooks
+- [API Reference](docs/api.rst) - Complete API documentation
 
 ## Testing
 
 ```bash
 # Run test suite
 python -m pytest tests/
+
+# Test multi-time functionality specifically  
+python tests/test_multi_time.py
 ```
 
 ## Contributing
@@ -216,16 +299,3 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 
 ## License
 
-MIT License - see LICENSE.txt for details
-
-## Citation
-
-If you use this package in your research, please cite:
-
-```bibtex
-@software{xamrex,
-  author = {Hetland, Robert},
-  title = {xamrex: AMReX Backend for xarray},
-  year = {2025},
-  url = {https://github.com/hetland/xamrex}
-}

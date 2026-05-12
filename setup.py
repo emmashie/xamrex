@@ -17,7 +17,7 @@ setup(
     ],
     entry_points={
         'xarray.backends': [
-            'amrex=xamrex.backend:AMReXCGridEntrypoint',
+            'amrex=xamrex.backend:AMReXEntrypoint',
         ],
     },
     python_requires='>=3.8',

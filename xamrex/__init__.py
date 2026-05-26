@@ -9,7 +9,7 @@ This package provides an xarray backend for reading AMReX plotfiles with:
 - xgcm-compatible grid metadata
 """
 
-from .backend import AMReXCGridEntrypoint
+from .backend import AMReXEntrypoint
 
 __version__ = "2.0.0"
-__all__ = ["AMReXCGridEntrypoint"]
+__all__ = ["AMReXEntrypoint"]

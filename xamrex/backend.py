@@ -21,6 +21,7 @@ from xarray.core.variable import Variable
 
 from .AMReX_array import AMReXDatasetMeta, AMReXFabsMetaSingleLevel
 from .refinement import create_refinement_handler
+from .coordinates import CGridCoordinateGenerator
 
 
 class AMReXLazyArray(BackendArray):
@@ -44,15 +45,27 @@ class AMReXLazyArray(BackendArray):
         
         # Use the new RefinementHandler for all refinement calculations
         self.refinement_handler = create_refinement_handler(meta)
-        
-        # Get array shape using the refinement handler.
-        # Auxiliary multifabs (e.g., rho2d/u2d/v2d) are stored as 2D arrays.
+
+        # Read the stagger tuple (sx, sy, sz) from the FAB metadata.
+        # For cell-centred groups this is (0,0,0); staggered groups add +1
+        # in the staggered direction(s) so the array has the correct size.
+        stagger = getattr(fab_meta, 'stagger', (0, 0, 0))
+
+        # Get array shape, accounting for staggering.
+        # level_dimensions stores [nx, ny, nz] in x,y,z order.
+        # Full data shape is (time, z, y, x).
         if self.group_dimensionality == 3:
-            self.shape = self.refinement_handler.get_full_shape(level, include_time=True)
+            level_dims = self.meta.get_level_dimensions(level)
+            nx = int(level_dims[0]) + stagger[0]
+            ny = int(level_dims[1]) + stagger[1]
+            nz = int(level_dims[2]) + stagger[2]
+            self.shape = (1, nz, ny, nx)
         else:
             level_dims = self.meta.get_level_dimensions(level)
             # Header stores [nx, ny, nz] ordering; variables use (time, y, x).
-            self.shape = (1, int(level_dims[1]), int(level_dims[0]))
+            nx = int(level_dims[0]) + stagger[0]
+            ny = int(level_dims[1]) + stagger[1]
+            self.shape = (1, ny, nx)
         self.dtype = np.float64
         
         # Create a dask array that will actually load data when accessed
@@ -205,6 +218,14 @@ class AMReXSingleLevelStore(AbstractDataStore):
             include_auxiliary_multifabs=include_auxiliary_multifabs,
             auxiliary_multifabs=auxiliary_multifabs,
         )
+
+        # Auto-include staggered multifab groups (UFace, VFace, WFace, Nu_nd) when present.
+        # This is the core of staggered-data support: users should not need to opt in
+        # with include_auxiliary_multifabs when true staggered data is available.
+        _STAGGERED_PREFIXES = {'UFace', 'VFace', 'WFace', 'Nu_nd'}
+        for group in list(self.meta.multifab_groups.keys()):
+            if group in _STAGGERED_PREFIXES and group not in self.selected_groups:
+                self.selected_groups.append(group)
         
         # Validate level exists
         if level > self.meta.max_level:
@@ -248,13 +269,7 @@ class AMReXSingleLevelStore(AbstractDataStore):
         
         # Get time dimension name
         time_dim_name = getattr(self.meta, 'time_dimension_name', 'ocean_time')
-        
-        # Create dimension names with the configurable time dimension
-        if self.meta.dimensionality == 3:
-            dim_names = [time_dim_name, 'z', 'y', 'x']  # Add time dimension
-        else:
-            dim_names = [time_dim_name, 'y', 'x']       # Add time dimension for 2D
-        
+
         # Create time coordinate (singleton dimension)
         variables[time_dim_name] = Variable(
             dims=(time_dim_name,),
@@ -264,43 +279,115 @@ class AMReXSingleLevelStore(AbstractDataStore):
                 'units': 'unknown',  # TODO: extract units from AMReX if available
             }
         )
-        
-        # Generate spatial coordinates using RefinementHandler
+
+        # ---------- Coordinate generation ----------------------------------------
+        # Cell-centred base coordinates (always created)
         coord_arrays = refinement_handler.get_coordinate_arrays(
             self.level, self.meta.domain_left_edge, self.meta.domain_right_edge
         )
-        
-        # Create spatial coordinate variables
         refinement_factors = refinement_handler.get_refinement_factors(self.level)
         for dim_name, coord_array in coord_arrays.items():
             dim_idx = ['x', 'y', 'z'].index(dim_name)
             refinement_factor = refinement_factors[dim_idx]
-            
-            # Calculate spacing info
             if len(coord_array) > 1:
                 spacing = coord_array[1] - coord_array[0]
             else:
                 spacing = 0.0
-            
-            base_spacing = spacing * refinement_factor
-            
             variables[dim_name] = Variable(
                 dims=(dim_name,),
                 data=coord_array,
                 attrs={
                     'long_name': f'{dim_name.upper()} coordinate',
-                    'units': 'unknown',  # TODO: extract from AMReX if available
+                    'units': 'unknown',
                     'spacing': float(spacing),
-                    'base_spacing': float(base_spacing),
+                    'base_spacing': float(spacing * refinement_factor),
                     'refinement_factor': int(refinement_factor),
                 }
             )
-        
-        # Create data variables for each field
+
+        # Generate staggered coordinates for any non-Cell groups present.
+        # Maps stagger tuple (sx,sy,sz) → (x_dim, y_dim, z_dim) names used in data arrays.
+        _STAGGER_DIM_MAP = {
+            (0, 0, 0): ('x',     'y',     'z'  ),
+            (1, 0, 0): ('x_u',   'y',     'z'  ),
+            (0, 1, 0): ('x',     'y_v',   'z'  ),
+            (0, 0, 1): ('x',     'y',     'z_w'),
+            (1, 1, 0): ('x_psi', 'y_psi', 'z'  ),
+            (1, 1, 1): ('x_psi', 'y_psi', 'z_w'),
+        }
+
+        level_dims = self.meta.get_level_dimensions(self.level)
+        domain_left  = self.meta.domain_left_edge
+        domain_right = self.meta.domain_right_edge
+        cgen = CGridCoordinateGenerator(
+            domain_left=domain_left,
+            domain_right=domain_right,
+            level_dimensions=self.meta.level_dimensions,
+            dimensionality=self.meta.dimensionality,
+            refinement_factors=self.meta.ref_factors,
+            level=self.level,
+        )
+
+        # Determine which staggered coordinate names are actually needed.
+        needed_coords = set()
+        for group in self.selected_groups:
+            if group not in self.fab_meta_by_group:
+                continue
+            stagger = getattr(self.fab_meta_by_group[group], 'stagger', (0, 0, 0))
+            x_dim, y_dim, z_dim = _STAGGER_DIM_MAP.get(stagger, ('x', 'y', 'z'))
+            needed_coords.add(x_dim)
+            needed_coords.add(y_dim)
+            if self.meta.dimensionality == 3:
+                needed_coords.add(z_dim)
+
+        # Create any staggered coordinate variables that are not already present.
+        nx_rho = int(level_dims[0])
+        ny_rho = int(level_dims[1])
+        nz_rho = int(level_dims[2]) if self.meta.dimensionality == 3 else 1
+
+        stag_coord_defs = {
+            # name: (n_points, generator_grid_type, axis)
+            'x_u':   (nx_rho + 1, 'u',   'X'),
+            'x_psi': (nx_rho + 1, 'psi', 'X'),
+            'y_v':   (ny_rho + 1, 'v',   'Y'),
+            'y_psi': (ny_rho + 1, 'psi', 'Y'),
+            'z_w':   (nz_rho + 1, 'w',   'Z'),
+        }
+        for coord_name, (n_pts, grid_type, axis) in stag_coord_defs.items():
+            if coord_name not in needed_coords or coord_name in variables:
+                continue
+            if axis == 'X':
+                arr = cgen._generate_x_coordinate(n_pts, grid_type)
+            elif axis == 'Y':
+                arr = cgen._generate_y_coordinate(n_pts, grid_type)
+            else:  # 'Z'
+                arr = cgen._generate_z_coordinate(n_pts, grid_type)
+            variables[coord_name] = Variable(
+                dims=(coord_name,),
+                data=arr,
+                attrs={
+                    'long_name': f'{coord_name} coordinate',
+                    'axis': axis,
+                    'c_grid_axis_shift': -0.5,
+                    'units': 'unknown',
+                }
+            )
+
+        # ---------- Data variables ------------------------------------------------
         base_refinement = refinement_handler.base_refinement
         for output_name, field, group in self.output_fields:
             group_info = self.meta.multifab_groups[group]
             group_dimensionality = group_info["dimensionality"]
+
+            # Determine dimension names based on group stagger.
+            stagger = getattr(self.fab_meta_by_group[group], 'stagger', (0, 0, 0))
+            x_dim, y_dim, z_dim = _STAGGER_DIM_MAP.get(stagger, ('x', 'y', 'z'))
+
+            if group_dimensionality == 3:
+                data_dims = [time_dim_name, z_dim, y_dim, x_dim]
+            else:
+                # 2D auxiliary multifabs (rho2d, u2d, v2d …)
+                data_dims = [time_dim_name, y_dim, x_dim]
 
             # Create lazy array wrapper
             lazy_array = AMReXLazyArray(
@@ -313,9 +400,6 @@ class AMReXSingleLevelStore(AbstractDataStore):
                 group_dimensionality=group_dimensionality,
             )
 
-            data_dims = dim_names if group_dimensionality == 3 else [time_dim_name, 'y', 'x']
-            
-            # Use the dask array directly instead of the wrapper
             variables[output_name] = Variable(
                 dims=data_dims,
                 data=lazy_array.dask_array,
@@ -323,6 +407,7 @@ class AMReXSingleLevelStore(AbstractDataStore):
                     'long_name': field,
                     'source_name': field,
                     'multifab_group': group,
+                    'grid_stagger': list(stagger),
                     'level': int(self.level),
                     'refinement_factor': int(base_refinement ** self.level),
                     '_FillValue': np.nan,
@@ -588,6 +673,10 @@ class AMReXEntrypoint(BackendEntrypoint):
         pattern: str = "plt_*",
         include_auxiliary_multifabs: bool = False,
         auxiliary_multifabs: list[str] | tuple[str, ...] | None = None,
+        xroms_format: bool = False,
+        xroms_vtransform: int = 2,
+        xroms_grid_file: str | os.PathLike[Any] | xr.Dataset | None = None,
+        xroms_strict_grid: bool = False,
         **kwargs
     ):
         """
@@ -613,6 +702,21 @@ class AMReXEntrypoint(BackendEntrypoint):
             Include all additional multifab groups listed in Header (e.g., rho2d, u2d, v2d).
         auxiliary_multifabs : list[str], optional
             Explicit auxiliary multifab group prefixes to include.
+        xroms_format : bool, default False
+            If True, convert dataset to xroms-compatible format with ROMS-style coordinate
+            names (xi_rho, eta_rho, s_rho, etc.) and attributes. Requires coordinates to be
+            present in standard AMReX names (x, y, z, x_u, y_v, z_w, etc.).
+        xroms_vtransform : int, default 2
+            ROMS vertical transform parameter (1=old, 2=new). Only used when xroms_format=True.
+            If the dataset has no Vtransform attribute, this value is assigned..
+        xroms_grid_file : str, Path, or xarray.Dataset, optional
+            Optional ROMS/REMORA grid or metadata NetCDF source used to fill in
+            missing xroms-required variables (e.g., hc, Cs_r, Cs_w, h, metrics).
+            Only used when xroms_format=True.
+        xroms_strict_grid : bool, default False
+            If True and xroms_grid_file is provided, raise an error when any
+            candidate grid variable/coordinate cannot be conformed and merged
+            into the target dataset shape.
         **kwargs
             Additional arguments (ignored for compatibility)
             
@@ -665,24 +769,41 @@ class AMReXEntrypoint(BackendEntrypoint):
         # Create coordinate dict (separate from data variables)
         coords = {}
         data_vars = {}
-        
-        ### RDH -- this needs a refactor for generalization. Works for current REMORA plot files.
-        # Get the time dimension name
+
+        # All dimension-coordinate variables: cell-centred and all staggered names.
         time_dim_name = time_dimension_name or 'ocean_time'
-        
+        _COORD_NAMES = {
+            time_dim_name,
+            'x', 'y', 'z',          # cell-centred (rho-points)
+            'x_u', 'y_v', 'z_w',    # face-centred (u/v/w-points)
+            'x_psi', 'y_psi',        # node-centred (psi-points)
+        }
+
         for name, var in variables.items():
-            if name in ['x', 'y', 'z', time_dim_name]:
+            if name in _COORD_NAMES:
                 coords[name] = var
             else:
                 data_vars[name] = var
-        #### /RDH
 
         # Create dataset
-        return xr.Dataset(
+        ds = xr.Dataset(
             data_vars=data_vars,
             coords=coords,
             attrs=attributes
         )
+        
+        # Convert to xroms format if requested
+        if xroms_format:
+            from .xroms_compat import to_xroms_format
+            ds = to_xroms_format(
+                ds,
+                create_grid=False,
+                vtransform=xroms_vtransform,
+                grid_file=xroms_grid_file,
+                strict_grid=xroms_strict_grid,
+            )
+        
+        return ds
     
     def _resolve_input_to_plotfiles(self, filename_or_obj, pattern: str = "plt_*") -> list:
         """

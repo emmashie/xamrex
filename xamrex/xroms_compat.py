@@ -204,24 +204,38 @@ def _add_vertical_params(ds, vtransform=2):
     if 'Vstretching' not in ds.attrs:
         ds.attrs['Vstretching'] = 4  # Default stretching type
     
-    # Check if s_rho coordinate exists and generate values if needed
+    def _needs_sigma_rebuild(vals):
+        """Return True when vertical coordinate values are not ROMS sigma-like."""
+        vals = np.asarray(vals)
+        if vals.size == 0:
+            return True
+        finite = np.isfinite(vals)
+        if not np.all(finite):
+            return True
+        # ROMS sigma coordinates should live near [-1, 0].
+        # AMReX plotfile physical z-coordinates (e.g. -5000..0 m) must be rebuilt.
+        vmin = float(vals.min())
+        vmax = float(vals.max())
+        if vmin < -1.5 or vmax > 0.5:
+            return True
+        return False
+
+    # Check if s_rho coordinate exists and generate sigma values if needed
     if 's_rho' in ds.coords:
         ns_rho = len(ds.s_rho)
-        # Check if values are just indices (not actual s-coordinates)
         s_rho_vals = ds.s_rho.values
-        if np.all(s_rho_vals == np.arange(len(s_rho_vals))):
-            # Generate proper s-coordinate values from 0 to -1
-            new_s_rho = -(np.arange(ns_rho) + 0.5) / ns_rho
+        if np.all(s_rho_vals == np.arange(len(s_rho_vals))) or _needs_sigma_rebuild(s_rho_vals):
+            # ROMS convention is bottom-to-surface ordering: approximately -1 -> 0
+            new_s_rho = -1.0 + (np.arange(ns_rho) + 0.5) / ns_rho
             ds.coords['s_rho'] = new_s_rho
     
-    # Check if s_w coordinate exists and generate values if needed
+    # Check if s_w coordinate exists and generate sigma values if needed
     if 's_w' in ds.coords:
         ns_w = len(ds.s_w)
-        # Check if values are just indices (not actual s-coordinates)
         s_w_vals = ds.s_w.values
-        if np.all(s_w_vals == np.arange(len(s_w_vals))):
-            # Generate proper s-coordinate values from 0 to -1
-            new_s_w = -np.arange(ns_w) / (ns_w - 1)
+        if np.all(s_w_vals == np.arange(len(s_w_vals))) or _needs_sigma_rebuild(s_w_vals):
+            # ROMS convention is bottom-to-surface ordering: -1 -> 0
+            new_s_w = -1.0 + np.arange(ns_w) / (ns_w - 1)
             ds.coords['s_w'] = new_s_w
     
     # Add notice about missing variables needed for full xroms functionality
@@ -463,6 +477,14 @@ def _merge_grid_file_metadata(ds, grid_file, strict_grid=False):
             val = grid_ds[attr_name].values
             if np.ndim(val) == 0:
                 ds.attrs[attr_name] = val.item()
+
+    # xroms expects hc as a dataset variable (ds.hc), not only as a global attr.
+    # Some grid files store hc in attrs, so promote it when missing.
+    if 'hc' not in ds and 'hc' in grid_ds.attrs:
+        ds['hc'] = xr.DataArray(
+            np.array(grid_ds.attrs['hc']),
+            attrs={'long_name': 'S-coordinate parameter, critical depth', 'units': 'meter'},
+        )
 
     return ds
 

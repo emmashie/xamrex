@@ -116,13 +116,69 @@ ds = ep.open_dataset(
 - `xroms_grid_file` (str, Path, or xr.Dataset):
   - Optional source dataset used to fill missing ROMS variables needed by xroms
   - Useful when AMReX plotfiles do not include values like `hc`, `Cs_r`, `Cs_w`, or `h`
-  - Existing variables in the AMReX dataset are not overwritten
+  - Existing variables in the AMReX dataset are not overwritten (merge is fill-only)
   - Can be a file path (e.g., grid/initial/history NetCDF) or an already-open `xarray.Dataset`
 
 - `xroms_strict_grid` (bool):
   - If `True` and `xroms_grid_file` is provided, raise an error when candidate
     grid variables/coordinates cannot be conformed to the dataset shape
   - If `False` (default), incompatible fields are skipped with warnings
+
+## Requirements and Data Sources
+
+When using `xroms_format=True`, there are two levels of requirements:
+
+1. **Coordinate rename/CF metadata only** (basic xgcm grid-aware operations)
+2. **Full `xroms.roms_dataset(...)` vertical-depth workflow** (computes `z_rho`, `z_w`, metrics)
+
+### Minimum for Basic xroms-Format Conversion
+
+At minimum, AMReX plotfiles need the core staggered coordinates/variables that map to ROMS-style dimensions:
+
+- Horizontal coordinates: `x`, `y` (plus staggered coordinates if present)
+- Vertical coordinates: `z` and optionally `z_w`
+- Data variables can remain AMReX-native names; aliases (`u`, `v`, `w`) are added when possible
+
+This mode is enough for many horizontal/staggered-grid operations but not enough for full physical depth reconstruction.
+
+### Required for `xroms.roms_dataset()` Depth Calculations
+
+To compute physically meaningful vertical coordinates (`z_rho`, `z_w`) with `Vtransform` 1 or 2, the dataset must include:
+
+- `h` (bathymetry)
+- `zeta` (free surface elevation)
+- `Cs_r` and `Cs_w` (stretching curves)
+- `s_rho` and `s_w` (sigma coordinates)
+- `hc` (critical depth parameter; scalar variable preferred)
+
+`xroms_grid_file` is intended to provide static ROMS metadata (`h`, `Cs_r`, `Cs_w`, masks, metrics, lon/lat, etc.) when missing from plotfiles.
+
+Important:
+
+- `zeta` is typically time-dependent and should usually come from the plotfile/history data being analyzed.
+- If `zeta` is absent, `xroms.roms_dataset()` cannot compute realistic time-varying depths.
+- If a variable already exists in the AMReX dataset, it is **not** replaced by `xroms_grid_file`; this can preserve mismatched values if names collide.
+
+### Grid File Expectations (`xroms_grid_file`)
+
+Recommended source: a ROMS-compatible NetCDF grid/ini/history file with dimensions that can conform to the AMReX dataset.
+
+Typical useful fields:
+
+- Required for depth reconstruction support: `h`, `Cs_r`, `Cs_w`, `s_rho`, `s_w`
+- Common horizontal metadata: `pm`, `pn`, `f`, `angle`, `mask_rho`, `mask_u`, `mask_v`, `mask_psi`, `lon_*`, `lat_*`
+- Vertical transform metadata: `Vtransform`, `Vstretching`
+- `hc` as either:
+  - scalar variable (preferred), or
+  - global attribute (supported; promoted to scalar dataset variable during conversion)
+
+If dimensions are incompatible, fields are skipped (or raise with `xroms_strict_grid=True`).
+
+### Vertical Coordinate Semantics
+
+`xroms` expects sigma-style vertical coordinates (`s_rho`, `s_w`) in approximately `[-1, 0]` and bottom-to-surface ordering.
+
+`xamrex` conversion now normalizes non-sigma vertical coordinates (for example physical-z plotfile coordinates) to sigma coordinates so depth formulas are consistent with ROMS conventions.
 
 ## Dataset Attributes
 
@@ -149,7 +205,7 @@ These are optional for basic grid operations.
 |----------|---------|
 | `h` | Water depth (bathymetry) for z-coordinate computation |
 | `zeta` | Sea surface elevation for z-coordinate computation |
-| `Cs_r` | Stretching curves at RHO-grid w-points |
+| `Cs_r` | Stretching curves at RHO-points |
 | `Cs_w` | Stretching curves at W-grid points |
 | `hc` | Critical depth for vertical coordinate stretching |
 
@@ -157,7 +213,7 @@ These are optional for basic grid operations.
 
 - **Required for**: Computing actual z-coordinates (physical depths)
 - **Optional for**: Grid operations, interpolation, staggered grid analysis
-- **Common availability**: Full ROMS output files always include these; simplified plotfiles may not
+- **Common availability**: Full ROMS output files usually include these; simplified plotfiles often do not
 
 ## Usage Examples
 
@@ -233,6 +289,7 @@ print(ds_time.u_vel.shape)  # (time, z, y, x)
 
 # Analyze time evolution
 surface_temp_evolution = ds_time.temp.isel(s_rho=-1)
+```
 
 ### Example 5: Supply ROMS Metadata From Grid File
 
@@ -248,6 +305,28 @@ ds = ep.open_dataset(
 
 # Now xroms.roms_dataset(ds, Vtransform=2) has required vertical metadata.
 ```
+
+### Example 6: Ensure `zeta` Is Present for Depth Calculations
+
+```python
+import xarray as xr
+from xamrex import AMReXEntrypoint
+
+ep = AMReXEntrypoint()
+
+ds = ep.open_dataset(
+  'path/to/plotfiles',
+  xroms_format=True,
+  xroms_grid_file='path/to/roms_grid_1km.nc',
+)
+
+# If zeta is missing, xroms depth calculations will fail or be non-physical.
+# Provide zeta from a matching history/ini source when available.
+if 'zeta' not in ds:
+    zeta_src = xr.open_dataset('path/to/matching_history_or_ini.nc')['zeta']
+    ds['zeta'] = zeta_src
+
+# Then call xroms.roms_dataset(ds, Vtransform=2)
 ```
 
 ## Coordinate Attributes
@@ -329,6 +408,23 @@ print(ds.coords)
 **Solution**: Verify the dataset was converted with `xroms_format=True` and check:
 ```python
 print(sorted(ds.coords))  # Should show xi_rho, eta_rho, s_rho, etc.
+```
+
+### Issue: Plotfile vs NetCDF `z_rho` disagree strongly
+
+**Common causes**:
+
+- `zeta` missing or sourced from a different run/time than the plotfile state
+- `h`, `Cs_r`, `Cs_w`, or `hc` differ between the two datasets
+- Sigma coordinate ordering mismatch (`s_rho` reversed)
+- Horizontal index mismatch when comparing subsets (for example one dataset cropped with `1:-1` and the other not)
+
+**Checks**:
+
+```python
+print(ds.s_rho.values[:3], ds.s_rho.values[-3:])
+print('has zeta:', 'zeta' in ds)
+print('has h/Cs/hc:', [k for k in ['h', 'Cs_r', 'Cs_w', 'hc'] if k in ds])
 ```
 
 ### Issue: xgcm Grid creation fails

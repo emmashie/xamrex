@@ -414,25 +414,32 @@ class AMReXFabsMetaSingleLevel():
             # Number of FABs in this level
             self.nfabs = int(header_file.readline().split()[0][1:])
             
-            # Set up regex patterns for parsing fab indices
+            # Set up regex patterns for parsing fab indices.
+            # AMReX FAB headers always use 3D format for the stagger tuple even in 2D datasets.
             _1dregx = r"-?\d+"
             _2dregx = r"-?\d+,-?\d+"
             _3dregx = r"-?\d+,-?\d+,-?\d+"
             _dim_finder = [
-                re.compile(rf"\(\(({ndregx})\) \(({ndregx})\) \({ndregx}\)\)$")
+                re.compile(rf"\(\(({ndregx})\) \(({ndregx})\) \(({_3dregx})\)\)$")
                 for ndregx in (_1dregx, _2dregx, _3dregx)
             ]
             _our_dim_finder = _dim_finder[self.dimensionality - 1]
 
-            # Collect fab index ranges
+            # Collect fab index ranges and stagger tuple.
+            # Stagger is the same for all FABs in a group; read it from the first FAB.
             fab_inds_lo = np.zeros((self.nfabs, self.dimensionality), dtype=int)
             fab_inds_hi = np.zeros((self.nfabs, self.dimensionality), dtype=int)
+            stagger_3d = (0, 0, 0)
             for fabnum in range(self.nfabs):
-                start, stop = _our_dim_finder.match(header_file.readline()).groups()
+                start, stop, stagger_str = _our_dim_finder.match(header_file.readline()).groups()
+                if fabnum == 0:
+                    stagger_3d = tuple(int(v) for v in stagger_str.split(","))
                 start = np.array(start.split(","), dtype=int)
                 stop = np.array(stop.split(","), dtype=int)
                 fab_inds_lo[fabnum, :] = start
                 fab_inds_hi[fabnum, :] = stop + 1  # Python-style indexing
+            # Store 3-element stagger tuple (sx, sy, sz) for use by array shape calculation.
+            self.stagger = stagger_3d
 
             # Verify we read all fab indices
             endcheck = header_file.readline()
